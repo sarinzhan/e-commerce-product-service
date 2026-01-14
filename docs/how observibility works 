@@ -1,0 +1,457 @@
+> можешь добавить ясность как именно (и какие зависимости) генерируются (делаются) трейсы
+
+⏺ Как работают трейсы в нашем проекте
+
+  Зависимости для трейсинга
+
+  <!-- 1. Micrometer Tracing - абстракция над трейсингом -->
+  <dependency>
+      <groupId>io.micrometer</groupId>
+      <artifactId>micrometer-tracing-bridge-otel</artifactId>
+  </dependency>
+
+  <!-- 2. OpenTelemetry OTLP Exporter - отправка в Tempo -->
+  <dependency>
+      <groupId>io.opentelemetry</groupId>
+      <artifactId>opentelemetry-exporter-otlp</artifactId>
+  </dependency>
+
+  Как это работает
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                         Spring Boot App                                  │
+  ├─────────────────────────────────────────────────────────────────────────┤
+  │                                                                          │
+  │  HTTP Request                                                            │
+  │       │                                                                  │
+  │       ▼                                                                  │
+  │  ┌─────────────────┐                                                    │
+  │  │ Spring MVC      │ ◄── auto-instrumented (создаёт span)               │
+  │  │ Filter          │     traceId: abc123, spanId: span1                 │
+  │  └────────┬────────┘                                                    │
+  │           │                                                              │
+  │           ▼                                                              │
+  │  ┌─────────────────┐                                                    │
+  │  │ Controller      │ ◄── auto-instrumented (child span)                 │
+  │  │                 │     traceId: abc123, spanId: span2                 │
+  │  └────────┬────────┘                                                    │
+  │           │                                                              │
+  │           ▼                                                              │
+  │  ┌─────────────────┐                                                    │
+  │  │ Service         │ ◄── auto-instrumented                              │
+  │  │                 │     traceId: abc123, spanId: span3                 │
+  │  └────────┬────────┘                                                    │
+  │           │                                                              │
+  │           ▼                                                              │
+  │  ┌─────────────────┐                                                    │
+  │  │ JPA Repository  │ ◄── auto-instrumented (SQL query span)             │
+  │  │ (Hibernate)     │     traceId: abc123, spanId: span4                 │
+  │  └─────────────────┘                                                    │
+  │                                                                          │
+  ├─────────────────────────────────────────────────────────────────────────┤
+  │  Micrometer Tracing Bridge                                               │
+  │       │                                                                  │
+  │       ▼                                                                  │
+  │  OpenTelemetry OTLP Exporter ──────────────────────► Tempo :4317        │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  Что автоматически инструментируется
+
+  | Компонент              | Что трейсится                                 |
+  |------------------------|-----------------------------------------------|
+  | Spring MVC             | Каждый HTTP запрос (endpoint, method, status) |
+  | RestTemplate/WebClient | Исходящие HTTP вызовы                         |
+  | JPA/Hibernate          | SQL запросы                                   |
+  | @Transactional         | Границы транзакций                            |
+  | @Async                 | Асинхронные методы                            |
+  | @Scheduled             | Scheduled задачи                              |
+
+  Конфигурация
+
+  # application.properties
+
+  # Включить трейсинг (по умолчанию 10%, ставим 100%)
+  management.tracing.sampling.probability=1.0
+
+  # Куда отправлять трейсы (Tempo)
+  management.otlp.tracing.endpoint=http://localhost:4317
+
+  Кастомные спаны (если нужно)
+
+  Если хочешь добавить свой span для критичной логики:
+
+  import io.micrometer.tracing.annotation.NewSpan;
+  import io.micrometer.tracing.annotation.SpanTag;
+
+  @Service
+  public class ProductService {
+
+      // Автоматически создаст span "processOrder"
+      @NewSpan("processOrder")
+      public void processOrder(
+              @SpanTag("orderId") String orderId,  // добавит тег
+              @SpanTag("userId") String userId) {
+          // бизнес логика
+      }
+  }
+
+  Или программно:
+
+  import io.micrometer.tracing.Tracer;
+
+  @Service
+  @RequiredArgsConstructor
+  public class ProductService {
+
+      private final Tracer tracer;
+
+      public void complexOperation() {
+          var span = tracer.nextSpan().name("complexOperation").start();
+          try (var ws = tracer.withSpan(span)) {
+              span.tag("custom.tag", "value");
+              // логика
+          } finally {
+              span.end();
+          }
+      }
+  }
+
+  Проверка трейсов
+
+  1. Сделай запрос к API
+  2. Открой Grafana → Explore → Tempo
+  3. Найди трейс по service.name = product-service
+
+  Хочешь добавить кастомные спаны в код?
+
+> а что именно позволяет micrometer-tracing-bridge-otel интегририровать в код спринга ?
+
+⏺ Как micrometer-tracing-bridge-otel интегрируется в Spring
+
+  Архитектура
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │                    Spring Boot Auto-Configuration                    │
+  │                                                                      │
+  │  ┌──────────────────────────────────────────────────────────────┐   │
+  │  │            Micrometer Tracing API (абстракция)                │   │
+  │  │                                                                │   │
+  │  │   Tracer, Span, SpanBuilder, Observation                      │   │
+  │  └──────────────────────────────────────────────────────────────┘   │
+  │                              │                                       │
+  │                              ▼                                       │
+  │  ┌──────────────────────────────────────────────────────────────┐   │
+  │  │         micrometer-tracing-bridge-otel (мост)                 │   │
+  │  │                                                                │   │
+  │  │   Конвертирует Micrometer API → OpenTelemetry API             │   │
+  │  └──────────────────────────────────────────────────────────────┘   │
+  │                              │                                       │
+  │                              ▼                                       │
+  │  ┌──────────────────────────────────────────────────────────────┐   │
+  │  │              OpenTelemetry SDK + OTLP Exporter                │   │
+  │  │                                                                │   │
+  │  │   Реальная имплементация трейсинга + отправка в Tempo         │   │
+  │  └──────────────────────────────────────────────────────────────┘   │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  Ключевой механизм: Observation API
+
+  Spring Boot 3+ использует Observation API — единый механизм для метрик И трейсов:
+
+  // Внутри Spring MVC (упрощённо)
+  public class ServerHttpObservationFilter {
+
+      private final ObservationRegistry registry;
+
+      public void doFilter(request, response, chain) {
+          // Создаёт Observation (= метрика + трейс одновременно)
+          Observation observation = Observation.createNotStarted("http.server.requests", registry)
+              .contextualName("HTTP " + request.getMethod())
+              .lowCardinalityKeyValue("method", request.getMethod())
+              .lowCardinalityKeyValue("uri", request.getRequestURI())
+              .start();
+
+          try {
+              chain.doFilter(request, response);
+              observation.lowCardinalityKeyValue("status", response.getStatus());
+          } catch (Exception e) {
+              observation.error(e);
+              throw e;
+          } finally {
+              observation.stop();  // Закрывает span + записывает метрику
+          }
+      }
+  }
+
+  Что делает bridge
+
+  // micrometer-tracing-bridge-otel внутри:
+
+  public class OtelTracer implements Tracer {
+
+      private final io.opentelemetry.api.trace.Tracer otelTracer;
+
+      @Override
+      public Span nextSpan() {
+          // Micrometer API -> OpenTelemetry API
+          io.opentelemetry.api.trace.Span otelSpan = otelTracer
+              .spanBuilder("span-name")
+              .startSpan();
+
+          return new OtelSpan(otelSpan);  // Обёртка
+      }
+  }
+
+  Auto-Configuration цепочка
+
+  spring-boot-starter-actuator
+         │
+         ▼
+  ObservationAutoConfiguration
+         │ создаёт
+         ▼
+  ObservationRegistry (singleton)
+         │
+         ▼
+  micrometer-tracing-bridge-otel
+         │ регистрирует
+         ▼
+  OtelTracingObservationHandler
+         │ слушает все Observation.start()/stop()
+         │ и создаёт OpenTelemetry Spans
+         ▼
+  opentelemetry-exporter-otlp
+         │ отправляет
+         ▼
+  Tempo (gRPC :4317)
+
+  Встроенные ObservationHandler'ы
+
+  Spring Boot регистрирует handlers для разных компонентов:
+
+  | Компонент  | Handler                            | Что делает         |
+  |------------|------------------------------------|--------------------|
+  | Spring MVC | ServerRequestObservationConvention | HTTP запросы       |
+  | WebClient  | ClientRequestObservationConvention | Исходящие HTTP     |
+  | JDBC       | DataSourceObservationListener      | SQL запросы        |
+  | JPA        | HibernateObservationHandler        | Hibernate операции |
+  | Scheduled  | ScheduledTaskObservationHandler    | @Scheduled методы  |
+
+  Пример: как трейсится HTTP запрос
+
+  1. Запрос приходит в ServerHttpObservationFilter
+
+  2. Filter вызывает:
+     Observation.start()
+          │
+          ▼
+     ObservationRegistry.onStart()
+          │
+          ▼
+     OtelTracingObservationHandler.onStart()
+          │
+          ▼
+     otelTracer.spanBuilder("HTTP GET /api/v1/products").startSpan()
+
+  3. Запрос обрабатывается (Controller → Service → Repository)
+     (каждый слой может создавать child spans)
+
+  4. Filter вызывает:
+     Observation.stop()
+          │
+          ▼
+     OtelTracingObservationHandler.onStop()
+          │
+          ▼
+     otelSpan.end()
+          │
+          ▼
+     OtlpGrpcSpanExporter.export(span) → Tempo
+
+  Почему именно Micrometer, а не напрямую OpenTelemetry?
+
+  | Подход                  | Плюсы                                 | Минусы              |
+  |-------------------------|---------------------------------------|---------------------|
+  | Micrometer (абстракция) | Vendor-neutral, легко сменить backend | Дополнительный слой |
+  | OpenTelemetry напрямую  | Больше контроля                       | Vendor lock-in      |
+
+  Spring выбрал Micrometer как абстракцию, чтобы можно было легко переключаться между:
+  - OpenTelemetry → Tempo/Jaeger
+  - Zipkin → Zipkin server
+  - Brave → любой Zipkin-совместимый
+
+> с RestClient/WebClient и JPA примерная такая же тема ? и в что такое micrometer ?
+
+⏺ Micrometer — что это?
+
+  Micrometer — это библиотека для метрик и трейсинга в Java. По сути это SLF4J, но для метрик.
+
+  SLF4J          = абстракция для логов     → Logback, Log4j, etc.
+  Micrometer     = абстракция для метрик    → Prometheus, Datadog, etc.
+  Micrometer Tracing = абстракция для трейсов → OpenTelemetry, Zipkin, etc.
+
+  Зачем нужна абстракция?
+
+  // БЕЗ Micrometer — привязка к конкретной системе
+  import io.prometheus.client.Counter;
+
+  Counter requests = Counter.build()
+      .name("http_requests_total")
+      .help("Total requests")
+      .register();
+
+  requests.inc();  // Prometheus-специфичный код
+
+  // С Micrometer — универсальный код
+  import io.micrometer.core.instrument.Counter;
+  import io.micrometer.core.instrument.MeterRegistry;
+
+  @RequiredArgsConstructor
+  public class MyService {
+      private final MeterRegistry registry;  // инжектится Spring'ом
+
+      public void doSomething() {
+          registry.counter("my.requests").increment();
+          // Работает с Prometheus, Datadog, InfluxDB, etc.
+      }
+  }
+
+  ---
+  RestClient/WebClient — как трейсится?
+
+  Да, механизм тот же — через Observation API:
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  WebClient.get().uri("/api/users").retrieve()                   │
+  │                         │                                        │
+  │                         ▼                                        │
+  │  ┌─────────────────────────────────────────────────────────┐    │
+  │  │  ObservationWebClientCustomizer                          │    │
+  │  │                                                          │    │
+  │  │  Observation.start("http.client.requests")               │    │
+  │  │    - uri: /api/users                                     │    │
+  │  │    - method: GET                                         │    │
+  │  │    - traceId: abc123 (propagates из parent)              │    │
+  │  └─────────────────────────────────────────────────────────┘    │
+  │                         │                                        │
+  │                         ▼                                        │
+  │              HTTP Request с headers:                             │
+  │              traceparent: 00-abc123-span456-01                   │
+  │                         │                                        │
+  │                         ▼                                        │
+  │              External Service                                    │
+  └─────────────────────────────────────────────────────────────────┘
+
+  Propagation — ключевой момент
+
+  Когда твой сервис вызывает другой сервис, traceId передаётся в HTTP headers:
+
+  GET /api/users HTTP/1.1
+  Host: user-service
+  traceparent: 00-abc123def456-span789-01
+
+  Это позволяет связать все запросы в одну цепочку:
+
+  Product Service          User Service           Order Service
+       │                        │                       │
+       │ traceId: abc123        │                       │
+       ├───────────────────────►│ traceId: abc123       │
+       │                        ├──────────────────────►│ traceId: abc123
+       │                        │                       │
+       │◄───────────────────────┤                       │
+       │                        │◄──────────────────────┤
+
+  ---
+  JPA/Hibernate — как трейсится?
+
+  Тоже через Observation, но немного по-другому:
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  productRepository.findById(id)                                  │
+  │                         │                                        │
+  │                         ▼                                        │
+  │  ┌─────────────────────────────────────────────────────────┐    │
+  │  │  Spring Data JPA                                         │    │
+  │  │  (ObservationRepositoryMethodInvocationHandler)          │    │
+  │  │                                                          │    │
+  │  │  Observation.start("spring.data.repository.invocations") │    │
+  │  │    - repository: ProductRepository                       │    │
+  │  │    - method: findById                                    │    │
+  │  └─────────────────────────────────────────────────────────┘    │
+  │                         │                                        │
+  │                         ▼                                        │
+  │  ┌─────────────────────────────────────────────────────────┐    │
+  │  │  Hibernate                                               │    │
+  │  │  (HibernateObservationHandler)                           │    │
+  │  │                                                          │    │
+  │  │  Observation.start("hibernate.query")                    │    │
+  │  │    - sql: SELECT * FROM products WHERE id = ?            │    │
+  │  │    - rows: 1                                             │    │
+  │  └─────────────────────────────────────────────────────────┘    │
+  │                         │                                        │
+  │                         ▼                                        │
+  │                    PostgreSQL                                    │
+  └─────────────────────────────────────────────────────────────────┘
+
+  ---
+  Итого: вся картина
+
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │                          MICROMETER                                   │
+  │                                                                       │
+  │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐       │
+  │  │ micrometer-core │  │micrometer-tracing│ │ Observation API │       │
+  │  │    (метрики)    │  │    (трейсы)      │ │  (объединяет)   │       │
+  │  └────────┬────────┘  └────────┬─────────┘ └────────┬────────┘       │
+  │           │                    │                     │                │
+  │           ▼                    ▼                     ▼                │
+  │  ┌─────────────────────────────────────────────────────────────┐     │
+  │  │                    Registry Implementations                  │     │
+  │  │                                                              │     │
+  │  │  Prometheus    OpenTelemetry    Zipkin    Datadog   etc.    │     │
+  │  └─────────────────────────────────────────────────────────────┘     │
+  └──────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │                     SPRING BOOT AUTO-CONFIG                          │
+  │                                                                       │
+  │  Автоматически инструментирует:                                      │
+  │                                                                       │
+  │  ✓ HTTP Server (Tomcat/Netty)     → http.server.requests             │
+  │  ✓ RestClient/WebClient           → http.client.requests             │
+  │  ✓ Spring Data JPA                → spring.data.repository           │
+  │  ✓ Hibernate                      → hibernate.query                  │
+  │  ✓ @Scheduled                     → spring.scheduled                 │
+  │  ✓ @Async                         → spring.async                     │
+  │  ✓ Kafka/RabbitMQ                 → messaging.*                      │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  Простыми словами:
+
+  | Что                  | Зачем                                      |
+  |----------------------|--------------------------------------------|
+  | Micrometer Core      | Считает метрики (counters, gauges, timers) |
+  | Micrometer Tracing   | Абстракция для трейсов (spans)             |
+  | Observation API      | Одна точка для метрик + трейсов            |
+  | Bridge (otel/zipkin) | Переводит в конкретный формат              |
+  | Spring Boot          | Авто-конфигурирует всё вместе              |
+
+
+
+ Итоговая архитектура:
+
+   ┌──────────────────────────────────────────────────────────────┐
+   │                     Product Service                          │
+   │                        :8080                                 │
+   ├──────────────────────────────────────────────────────────────┤
+   │  Logback ──push──► Loki :3100                                │
+   │  OTLP    ──push──► Tempo :4317                               │
+   │  /actuator/prometheus ◄──pull── Prometheus :9090             │
+   └──────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+                       ┌──────────────┐
+                       │   Grafana    │
+                       │    :3000     │
+                       └──────────────┘
